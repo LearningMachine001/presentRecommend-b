@@ -1,16 +1,20 @@
 from flask import Flask, request, jsonify
-from final import analyze_kakao_file, recommend_from_analysis
 import os
 import uuid
 import json
+from flask_cors import CORS
+import uuid
+
+
+from final_test import extract_kakao_dialogues, is_valid_conversation, classify_topic, classify_avg_score_from_pairs, extract_interest_weighted_keywords, recommend_products_from_keywords
 
 app = Flask(__name__)
+CORS(app)
 UPLOAD_FOLDER = "uploaded"
 ANALYSIS_FOLDER = "analysis"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ANALYSIS_FOLDER, exist_ok=True)
 
-# 공통 응답 포맷 함수
 def api_response(success, data=None, message=None, error=None):
     return jsonify({
         "success": success,
@@ -19,8 +23,6 @@ def api_response(success, data=None, message=None, error=None):
         "error": error
     })
 
-
-# 파일 업로드
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
     file = request.files.get("file")
@@ -28,101 +30,76 @@ def upload_file():
         return api_response(False, error="파일이 없습니다.")
 
     file_id = str(uuid.uuid4())
-    file_path = os.path.join(UPLOAD_FOLDER, file_id + ".txt")
-    file.save(file_path)
+    path = os.path.join(UPLOAD_FOLDER, file_id + ".txt")
+    file.save(path)
+    return api_response(True, data={"fileId": file_id}, message="파일 업로드 성공")
 
-    return api_response(True, message="업로드 성공", data={"fileId": file_id})
-
-
-# 대화 분석
 @app.route("/api/analyze", methods=["POST"])
-def analyze():
+def analyze_file():
     data = request.get_json()
     file_id = data.get("fileId")
-
     file_path = os.path.join(UPLOAD_FOLDER, file_id + ".txt")
     if not os.path.exists(file_path):
-        return api_response(False, error="해당 파일이 존재하지 않습니다.")
+        return api_response(False, error="해당 파일을 찾을 수 없습니다.")
 
-    try:
-        analysis_result = analyze_kakao_file(file_path)
+    data_by_date = extract_kakao_dialogues(file_path)
+    result = []
 
-        # 저장 (다음 요청을 위한 캐싱 용도)
-        with open(os.path.join(ANALYSIS_FOLDER, file_id + ".json"), "w", encoding="utf-8") as f:
-            json.dump(analysis_result, f, ensure_ascii=False, indent=2)
+    for date, msgs in sorted(data_by_date.items()):
+        msgs = [m for m in msgs if is_valid_conversation(m)]
+        if not msgs:
+            continue
+        full_text = " ".join(msgs)
+        subject, main_cat = classify_topic(full_text)
+        intimacy = classify_avg_score_from_pairs(msgs)
+        keywords = extract_interest_weighted_keywords(msgs)
 
-        # 변환 (프론트 요구 형식에 맞게 단순화 예시)
-        response_data = {
-    "keywords": [
-        {"name": kw, "value": round(score, 2)}
-        for entry in analysis_result
-        for kw, score in entry["keywords"]
-    ],
-    "relationship": [
-        {
-            "date": entry["date"],
-            "intimacy": min(100, len(entry["keywords"]) * 10),
-            "trend": min(100, len(entry["keywords"]) * 5)
-        }
-        for entry in analysis_result
-    ]
-}
-        return api_response(True, data=response_data)
+        result.append({
+            "date": date,
+            "subject": subject,
+            "category": main_cat,
+            "intimacy": intimacy,
+            "keywords": [{"name": kw, "score": round(score, 2)} for kw, score in keywords[:5]]
+        })
 
-    except Exception as e:
-        return api_response(False, error=str(e))
+    return api_response(True, data=result, message="분석 완료")
 
-
-# 선물 추천
 @app.route("/api/recommendations", methods=["POST"])
-def recommend():
+def recommend_file():
     data = request.get_json()
     file_id = data.get("fileId")
-    page = int(data.get("page", 1))
-    limit = int(data.get("limit", 5))
-    category = data.get("category")
-    max_price = data.get("maxPrice")
+    file_path = os.path.join(UPLOAD_FOLDER, file_id + ".txt")
+    if not os.path.exists(file_path):
+        return api_response(False, error="해당 파일을 찾을 수 없습니다.")
 
-    try:
-        # 분석 결과 로드
-        analysis_path = os.path.join("analysis", file_id + ".json")
-        if not os.path.exists(analysis_path):
-            return api_response(False, error="분석 데이터가 없습니다.")
+    data_by_date = extract_kakao_dialogues(file_path)
+    result = []
 
-        with open(analysis_path, "r", encoding="utf-8") as f:
-            analysis_result = json.load(f)
+    for date, msgs in sorted(data_by_date.items()):
+        msgs = [m for m in msgs if is_valid_conversation(m)]
+        if not msgs:
+            continue
 
-        recommendations = recommend_from_analysis(analysis_result, filters={
-            "category": category,
-            "maxPrice": max_price
+        full_text = " ".join(msgs)
+        subject, main_cat = classify_topic(full_text)
+        intimacy = classify_avg_score_from_pairs(msgs)
+        keywords = extract_interest_weighted_keywords(msgs)
+
+        # 추천 결과 → 바로 products로 받기 (이제 dict 포함됨)
+        recs = recommend_products_from_keywords(
+            sorted_keywords=keywords,
+            allowed_category=main_cat,
+            intimacy_score=intimacy
+        )
+
+        result.append({
+            "date": date,
+            "recommendations": recs  # [{id, name, imageUrl, ...}, ...]
         })
 
-        flat_list = []
-        for rec in recommendations:
-            for item in rec["recommendations"]:
-                flat_list.append({
-                    "id": str(uuid.uuid4()),
-                    "name": item["name"],
-                    "price": item["price"],
-                    "imageUrl": item["imageUrl"],
-                    "description": item["description"],
-                    "category": item["category"],
-                })
-
-        paged = flat_list[(page - 1) * limit: page * limit]
-        total_pages = (len(flat_list) + limit - 1) // limit
-
-        return api_response(True, data={
-            "gifts": paged,
-            "totalCount": len(flat_list),
-            "currentPage": page,
-            "totalPages": total_pages
-        })
-
-    except Exception as e:
-        return api_response(False, error=str(e))
-
+    return api_response(True, data=result, message="추천 완료")
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
